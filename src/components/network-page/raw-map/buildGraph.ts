@@ -15,31 +15,69 @@ export type BuildGraphOptions = {
     childrenLabel: string;
 };
 
+/** Key identifying a directed link between two nodes */
+const linkKey = (sourceIeeeAddr: string, targetIeeeAddr: string): string => `${sourceIeeeAddr}|${targetIeeeAddr}`;
+
+/** Set the value only if the key is not present yet (keeps the first match, same as `Array.find`) */
+const setFirst = <K, V>(map: Map<K, V>, key: K, value: V): void => {
+    if (!map.has(key)) {
+        map.set(key, value);
+    }
+};
+
 /**
  * Compute the reagraph nodes & edges from a raw network map.
+ *
+ * All lookups are done through maps built in a single pass, keeping the whole computation linear in the number of nodes/links/devices
+ * (instead of searching the arrays for every node and every link).
  */
 export function buildGraph(map: Zigbee2MQTTNetworkMap, devices: Device[], options: BuildGraphOptions): [GraphNode[], GraphEdge[]] {
     const { showParents, showChildren, showSiblings, showIcons, excludedNodes, childrenLabel } = options;
     const computedNodes: GraphNode[] = [];
     const computedEdges: GraphEdge[] = [];
     const processedLinks: [NetworkMapLink, NetworkMapLink | undefined][] = [];
+    const excluded = excludedNodes ? new Set(excludedNodes) : undefined;
+    const devicesByIeee = new Map<string, Device>();
+    const nodesByIeee = new Map<string, NetworkMapNode>();
+    /** first Parent link by target (the parent is the source) */
+    const parentLinks = new Map<string, NetworkMapLink>();
+    /** first Child link by source (the parent is the target) */
+    const childLinks = new Map<string, NetworkMapLink>();
+    /** first link by source+target, used to find the opposite link */
+    const linksByKey = new Map<string, NetworkMapLink>();
+
+    for (const device of devices) {
+        setFirst(devicesByIeee, device.ieee_address, device);
+    }
 
     for (const node of map.nodes) {
-        if (excludedNodes?.includes(node)) {
+        setFirst(nodesByIeee, node.ieeeAddr, node);
+    }
+
+    for (const link of map.links) {
+        if (link.relationship === ZigbeeRelationship.NeighborIsParent) {
+            setFirst(parentLinks, link.target.ieeeAddr, link);
+        } else if (link.relationship === ZigbeeRelationship.NeighborIsAChild) {
+            setFirst(childLinks, link.source.ieeeAddr, link);
+        }
+
+        setFirst(linksByKey, linkKey(link.source.ieeeAddr, link.target.ieeeAddr), link);
+    }
+
+    for (const node of map.nodes) {
+        if (excluded?.has(node)) {
             // displayed separately
             continue;
         }
 
-        const device = devices.find((device) => device.ieee_address === node.ieeeAddr);
+        const device = devicesByIeee.get(node.ieeeAddr);
         // determine the parent friendly name for clustering from either the target (parent is source) or the source (parent is target)
-        const parent = map.links.find((link) => link.relationship === ZigbeeRelationship.NeighborIsParent && link.target.ieeeAddr === node.ieeeAddr);
-        let parentFriendlyName = parent ? map.nodes.find((n) => n.ieeeAddr === parent!.source.ieeeAddr)?.friendlyName : undefined;
+        const parent = parentLinks.get(node.ieeeAddr);
+        let parentFriendlyName = parent ? nodesByIeee.get(parent.source.ieeeAddr)?.friendlyName : undefined;
 
         if (!parent) {
-            const child = map.links.find(
-                (link) => link.relationship === ZigbeeRelationship.NeighborIsAChild && link.source.ieeeAddr === node.ieeeAddr,
-            );
-            parentFriendlyName = child ? map.nodes.find((n) => n.ieeeAddr === child!.target.ieeeAddr)?.friendlyName : undefined;
+            const child = childLinks.get(node.ieeeAddr);
+            parentFriendlyName = child ? nodesByIeee.get(child.target.ieeeAddr)?.friendlyName : undefined;
 
             if (parentFriendlyName) {
                 parentFriendlyName += ` - ${childrenLabel}`;
@@ -89,9 +127,7 @@ export function buildGraph(map: Zigbee2MQTTNetworkMap, devices: Device[], option
             continue;
         }
 
-        const oppositeLink = map.links.find(
-            (oLink) => oLink.source.ieeeAddr === link.target.ieeeAddr && oLink.target.ieeeAddr === link.source.ieeeAddr,
-        );
+        const oppositeLink = linksByKey.get(linkKey(link.target.ieeeAddr, link.source.ieeeAddr));
 
         // only add Parent when Parent+Child present
         if (!(link.relationship === ZigbeeRelationship.NeighborIsAChild && oppositeLink?.relationship === ZigbeeRelationship.NeighborIsParent)) {
@@ -100,20 +136,12 @@ export function buildGraph(map: Zigbee2MQTTNetworkMap, devices: Device[], option
     }
 
     for (const [, bestSibling] of bestSiblings) {
-        const oppositeLink = map.links.find(
-            (oLink) => oLink.source.ieeeAddr === bestSibling.target.ieeeAddr && oLink.target.ieeeAddr === bestSibling.source.ieeeAddr,
-        );
+        const oppositeLink = linksByKey.get(linkKey(bestSibling.target.ieeeAddr, bestSibling.source.ieeeAddr));
 
         processedLinks.push([bestSibling, oppositeLink]);
     }
 
-    const ignoreLinks: NetworkMapLink[] = [];
-
     for (const [link, oppositeLink] of processedLinks) {
-        if (ignoreLinks.includes(link)) {
-            continue;
-        }
-
         if (link.relationship === ZigbeeRelationship.NeighborIsASibling) {
             if (
                 oppositeLink?.relationship === ZigbeeRelationship.NeighborIsParent ||
