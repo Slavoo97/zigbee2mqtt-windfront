@@ -1,32 +1,15 @@
 import merge from "lodash/merge.js";
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import {
-    GraphCanvas,
-    type GraphCanvasRef,
-    type GraphEdge,
-    type GraphNode,
-    type LabelVisibilityType,
-    type LayoutTypes,
-    lightTheme,
-    type Theme,
-    useSelection,
-} from "reagraph";
+import { GraphCanvas, type GraphCanvasRef, type LabelVisibilityType, type LayoutTypes, lightTheme, type Theme, useSelection } from "reagraph";
 import store2 from "store2";
 import type { Zigbee2MQTTNetworkMap } from "zigbee2mqtt";
 import { useShallow } from "zustand/react/shallow";
 import { NETWORK_MAP_CONFIG_KEY } from "../../localStoreConsts.js";
 import { useAppStore } from "../../store.js";
 import fontUrl from "./../../styles/NotoSans-Regular.ttf";
-import { getZ2MDeviceImage } from "../device/index.js";
-import {
-    cssColorToRgba,
-    EDGE_RELATIONSHIP_FILL_COLORS,
-    getUnlinkedNodes,
-    type NetworkMapLink,
-    NODE_TYPE_FILL_COLORS,
-    ZigbeeRelationship,
-} from "./index.js";
+import { cssColorToRgba, getUnlinkedNodes } from "./index.js";
+import { buildGraph } from "./raw-map/buildGraph.js";
 import ContextMenu from "./raw-map/ContextMenu.js";
 import Controls from "./raw-map/Controls.js";
 import Legend from "./raw-map/Legend.js";
@@ -122,129 +105,18 @@ const RawNetworkMap = memo(({ sourceIdx, map }: RawNetworkMapProps) => {
 
     const unlinkedNodes = useMemo(() => getUnlinkedNodes(map), [map]);
 
-    const [nodes, edges] = useMemo(() => {
-        const computedNodes: GraphNode[] = [];
-        const computedEdges: GraphEdge[] = [];
-        const processedLinks: [NetworkMapLink, NetworkMapLink | undefined][] = [];
-
-        for (const node of map.nodes) {
-            if (config.segregateUnlinked && unlinkedNodes.includes(node)) {
-                // displayed separately
-                continue;
-            }
-
-            const device = devices.find((device) => device.ieee_address === node.ieeeAddr);
-            // determine the parent friendly name for clustering from either the target (parent is source) or the source (parent is target)
-            const parent = map.links.find(
-                (link) => link.relationship === ZigbeeRelationship.NeighborIsParent && link.target.ieeeAddr === node.ieeeAddr,
-            );
-            let parentFriendlyName = parent ? map.nodes.find((n) => n.ieeeAddr === parent!.source.ieeeAddr)?.friendlyName : undefined;
-
-            if (!parent) {
-                const child = map.links.find(
-                    (link) => link.relationship === ZigbeeRelationship.NeighborIsAChild && link.source.ieeeAddr === node.ieeeAddr,
-                );
-                parentFriendlyName = child ? map.nodes.find((n) => n.ieeeAddr === child!.target.ieeeAddr)?.friendlyName : undefined;
-
-                if (parentFriendlyName) {
-                    parentFriendlyName += ` - ${t(($) => $.children)}`;
-                }
-            }
-
-            computedNodes.push({
-                id: node.ieeeAddr,
-                data: {
-                    ...node,
-                    parent: parentFriendlyName,
-                },
-                label: node.friendlyName,
-                labelVisible: true,
-                fill: NODE_TYPE_FILL_COLORS[node.type as keyof typeof NODE_TYPE_FILL_COLORS],
-                icon:
-                    config.showIcons && device?.definition
-                        ? device.definition.icon || (device.supported ? getZ2MDeviceImage(device)[0] : undefined)
-                        : undefined,
-            });
-        }
-
-        const bestSiblings = new Map<string, NetworkMapLink>();
-
-        for (const link of map.links) {
-            if (
-                (!showParents && link.relationship === ZigbeeRelationship.NeighborIsParent) ||
-                (!showChildren && link.relationship === ZigbeeRelationship.NeighborIsAChild) ||
-                (!showSiblings && link.relationship === ZigbeeRelationship.NeighborIsASibling)
-            ) {
-                continue;
-            }
-
-            if (link.relationship === ZigbeeRelationship.NeighborIsASibling) {
-                const bestSibling = bestSiblings.get(link.source.ieeeAddr);
-
-                // pick lowest depth, or highest LQI, de-dupe LQI by lowest depth
-                // not "perfect", but should represent the network mostly accurately, without crowding with pointless sibling links
-                if (
-                    !bestSibling ||
-                    // XXX: add exception when depth===255 (non-value)?
-                    link.depth < bestSibling.depth ||
-                    link.lqi > bestSibling.lqi ||
-                    (bestSibling.lqi === link.lqi && link.depth < bestSibling.depth)
-                ) {
-                    bestSiblings.set(link.source.ieeeAddr, link);
-                }
-
-                continue;
-            }
-
-            const oppositeLink = map.links.find(
-                (oLink) => oLink.source.ieeeAddr === link.target.ieeeAddr && oLink.target.ieeeAddr === link.source.ieeeAddr,
-            );
-
-            // only add Parent when Parent+Child present
-            if (!(link.relationship === ZigbeeRelationship.NeighborIsAChild && oppositeLink?.relationship === ZigbeeRelationship.NeighborIsParent)) {
-                processedLinks.push([link, oppositeLink]);
-            }
-        }
-
-        for (const [, bestSibling] of bestSiblings) {
-            const oppositeLink = map.links.find(
-                (oLink) => oLink.source.ieeeAddr === bestSibling.target.ieeeAddr && oLink.target.ieeeAddr === bestSibling.source.ieeeAddr,
-            );
-
-            processedLinks.push([bestSibling, oppositeLink]);
-        }
-
-        const ignoreLinks: NetworkMapLink[] = [];
-
-        for (const [link, oppositeLink] of processedLinks) {
-            if (ignoreLinks.includes(link)) {
-                continue;
-            }
-
-            if (link.relationship === ZigbeeRelationship.NeighborIsASibling) {
-                if (
-                    oppositeLink?.relationship === ZigbeeRelationship.NeighborIsParent ||
-                    oppositeLink?.relationship === ZigbeeRelationship.NeighborIsAChild
-                ) {
-                    // skip Sibling link when Parent/Child link also present
-                    continue;
-                }
-            }
-
-            computedEdges.push({
-                id: `${link.source.ieeeAddr}-${link.target.ieeeAddr}-${link.relationship}`,
-                data: link,
-                label: oppositeLink ? `${link.lqi} / ${oppositeLink.lqi ?? "?"}` : `${link.lqi}`,
-                size: link.relationship === ZigbeeRelationship.NoneOfTheAbove ? 0.5 : 1,
-                labelVisible: true,
-                source: link.source.ieeeAddr,
-                target: link.target.ieeeAddr,
-                fill: EDGE_RELATIONSHIP_FILL_COLORS[link.relationship as keyof typeof EDGE_RELATIONSHIP_FILL_COLORS],
-            });
-        }
-
-        return [computedNodes, computedEdges];
-    }, [map, unlinkedNodes, showParents, showChildren, showSiblings, t, devices, config.showIcons, config.segregateUnlinked]);
+    const [nodes, edges] = useMemo(
+        () =>
+            buildGraph(map, devices, {
+                showParents,
+                showChildren,
+                showSiblings,
+                showIcons: config.showIcons,
+                excludedNodes: config.segregateUnlinked ? unlinkedNodes : undefined,
+                childrenLabel: t(($) => $.children),
+            }),
+        [map, unlinkedNodes, showParents, showChildren, showSiblings, t, devices, config.showIcons, config.segregateUnlinked],
+    );
 
     // reagraph resets dragged positions whenever this reference changes, keep it stable across renders
     const layoutOverrides = useMemo(
